@@ -17,12 +17,14 @@
 
 #import "parseCSV.h"
 
+static NSString *cellInvalidLabel = nil;
+
 /* Macros for determining if the given character is End Of Line or not */
 #define EOL(x) ((*(x) == '\r' || *(x) == '\n') && *(x) != '\0')
 #define NOT_EOL(x) (*(x) != '\0' && *(x) != '\r' && *(x) != '\n')
 
-//char possibleDelimiters[4] = ",;\t\0";
-char possibleDelimiters[5] = ",;\t|\0";
+//const char possibleDelimiters[] = ",;\t|. \0"; // FIXME: Needs testing; will probably fail in searchDelimiter()
+const char possibleDelimiters[] = ",;\t|\0";
 NSString *possibleDelimiterNames[] = {
 	@"Comma (,)",
 	@"Semicolon (;)",
@@ -34,6 +36,8 @@ NSString *possibleDelimiterNames[] = {
  NSLocalizedString(@"Semicolon (;)", @"cCSVParseDelimiterNames")
  NSLocalizedString(@"Tab Symbol", @"cCSVParseDelimiterNames")
  NSLocalizedString(@"Pipe Symbol (|)" @"cCSVParseDelimiterNames")
+ //NSLocalizedString(@"Period (.)" @"cCSVParseDelimiterNames")
+ //NSLocalizedString(@"Space ( )" @"cCSVParseDelimiterNames")
  */
 
 
@@ -56,35 +60,37 @@ NSString *supportedLineEndingNames[] = {
 
 
 /*
- * replacement for strstr() which does only check every char instead
+ * replacement for strstr() which checks every char instead
  * of complete strings
- * Warning: Do not call it with haystack == NULL || needle == NULL!
+ * Warning: Do not call it with haystack == NULL || needle == '\0'!
  *
  */
 static char *cstrstr(const char *haystack_p, const char needle) {
 	char *text_p = (char *)haystack_p;
+	
 	while (*text_p != '\0') {
-		if (*text_p == needle)
+		if (*text_p == needle) {
 			return text_p;
+		}
 		text_p++;
 	}
+	
 	return NULL;
 }
 
 char searchDelimiter(char *text_p) {
-	char delimiter = '\n';
-	
-	// ...we assume that this is the header which also contains the separation character
-	while (NOT_EOL(text_p) && cstrstr(possibleDelimiters, *text_p) == NULL)
+	// We assume that this is the header row, which we check for separation characters.
+	while (NOT_EOL(text_p) && cstrstr(possibleDelimiters, *text_p) == NULL) {
 		text_p++;
+	}
 	
-	// Check if a delimiter was found and set it
+	// Check if a delimiter was found and set it.
 	if (NOT_EOL(text_p)) {
-		delimiter = *cstrstr(possibleDelimiters, *text_p);
+		char delimiter = *cstrstr(possibleDelimiters, *text_p);
 		return delimiter;
 	}
 	else {
-		return 0;
+		return '\0';
 	}
 }
 
@@ -101,9 +107,27 @@ NSString * parseString(char *text_p, char *previousStop_p, NSStringEncoding enco
 		stringSize -= 2;
 	}
 	
-	NSMutableString *tempString = [[NSMutableString alloc] initWithBytes:previousStop_p
-																  length:stringSize
-																encoding:encoding];
+	NSMutableString *tempString = nil;
+
+	while (tempString == nil) {
+		tempString = [[NSMutableString alloc] initWithBytes:previousStop_p
+													 length:stringSize
+												   encoding:encoding];
+		
+		// We use NSMacOSRomanStringEncoding as an emergency fallback if the above fails.
+		// This can happen in case the bytes are invalid in the selected encoding.
+		// NSMacOSRomanStringEncoding is Apple recommended choice for this kind of scenario
+		// as it supports most of the 8-bit range.
+		if (encoding != NSMacOSRomanStringEncoding && tempString == nil) {
+			// Retry will fallback encoding.
+			encoding = NSMacOSRomanStringEncoding;
+		}
+		else if (encoding == NSMacOSRomanStringEncoding) {
+			// Fail more or less gracefully.
+			tempString = [[NSMutableString alloc] initWithString:cellInvalidLabel];
+			break;
+		}
+	}
 	
 	[tempString replaceOccurrencesOfString:@"\"\"" 
 								withString:@"\"" 
@@ -120,8 +144,13 @@ NSString * parseString(char *text_p, char *previousStop_p, NSStringEncoding enco
 	BOOL _fileMode;
 }
 
++ (void)initialize {
+	cellInvalidLabel = [NSLocalizedString(@"**encoding or data invalid**", @"cell invalid label") retain];
+}
+
 -(id)init {
 	self = [super init];
+	
 	if (self) {
 		// Set default _bufferSize
 		_bufferSize = 2049;
@@ -140,6 +169,7 @@ NSString * parseString(char *text_p, char *previousStop_p, NSStringEncoding enco
 		
 		_data = nil;
 	}
+	
 	return self;
 }
 
@@ -216,7 +246,7 @@ NSString * parseString(char *text_p, char *previousStop_p, NSStringEncoding enco
 	}
 
 	// While there is data to be parsed…
-	while (n > 0) {
+	while (n > 0 || incompleteRow_p != NULL) {
 		
 		if (incompleteRow_p != NULL) {
 			incompleteRowLength = strlen(incompleteRow_p);
@@ -258,18 +288,33 @@ NSString * parseString(char *text_p, char *previousStop_p, NSStringEncoding enco
 			n = [dataStream read:(uint8_t *)(buffer_p + incompleteRowLength) maxLength:(sizeof(char) * blockCharCount)];
 		}
 
-		if (n <= 0)  break; // End of file or error while reading.
-		
-		const bool readEntireBlock = ((size_t)n == blockCharCount);
+		if (n < 0) {
+			break; // Error while reading.
+		}
+		else if (n > 0) {
+			if ((size_t)n > blockCharCount) {
+				assert(false);
+				break; // Should not happen: would signify a logic error in this method.
+			}
+			else {
+				// Everything appears to be fine.
+			}
+		}
+		else /* n == 0 */ {
+			if (incompleteRowLength == 0) {
+				break; // End of file.
+			}
+			else {
+				// We still have data taken from the last incomplete row.
+			}
+		}
 		
 		// Terminate buffer correctly.
-		if ((size_t)n <= blockCharCount) {
-			buffer_p[incompleteRowLength + n] = '\0';
-		}
-		else {
-			assert(false);
-			break; // Should not happen: would signify a logic error in this method.
-		}
+		char *endChar_p = &(buffer_p[incompleteRowLength + n]);
+		*endChar_p = '\0';
+		
+		const bool readEntireBlock = ((size_t)n == blockCharCount);
+		const bool readingComplete = (readEntireBlock == false || n == 0);
 		
 		text_p = buffer_p;
 		
@@ -309,7 +354,8 @@ NSString * parseString(char *text_p, char *previousStop_p, NSStringEncoding enco
 					} 
 					else if (*text_p == _delimiter && (quoteCount % 2) == 0) {
 						// This is a delimiter which is not between (an unmachted pair of) quotes.
-						[csvRow addObject:parseString(text_p, previousStop_p, _encoding)];
+						NSString *cellString = parseString(text_p, previousStop_p, _encoding);
+						[csvRow addObject:cellString];
 						previousStop_p = text_p + 1;
 					}
 					
@@ -319,15 +365,19 @@ NSString * parseString(char *text_p, char *previousStop_p, NSStringEncoding enco
 				
 				addCurrentRowAndStartNew = false;
 				
-				if (previousStop_p == text_p && *(text_p - 1) == _delimiter) {
+				if (previousStop_p == text_p && ((buffer_p == text_p) || (buffer_p < text_p && *(text_p - 1) == _delimiter))) { // Last cell of row is empty.
 					// Empty cell.
 					[csvRow addObject:@""];
 					
 					addCurrentRowAndStartNew = true;
 				}
-				else if (previousStop_p != text_p &&
-						 (quoteCount % 2) == 0 &&
-						 (*text_p != '\0' || (*text_p == '\0' && readEntireBlock == false))) {
+				else if ((*text_p != '\0' &&
+						  previousStop_p != text_p &&
+						  (quoteCount % 2) == 0) // Non-empty, unquoted or correctly quoted cell that doesn’t end at the buffer boundary.
+						 ||
+						 (*text_p == '\0' &&
+						  readingComplete) // Cell that ends with the end of the file.
+						 ) {
 					// Non-empty cell that with certainty was not split apart by the buffer size limit.
 					NSString *cellString = parseString(text_p, previousStop_p, _encoding);
 					[csvRow addObject:cellString];
@@ -336,28 +386,47 @@ NSString * parseString(char *text_p, char *previousStop_p, NSStringEncoding enco
 				} 
 				
 				if (addCurrentRowAndStartNew) {
-					if ((size_t)(buffer_p + incompleteRowLength + blockCharCount - text_p) > 0) {
+					bool addCurrentRow = false;
+					
+					if (text_p < endChar_p) {
+						// There is more data in the buffer. -> Process the next row.
 						rowStart_p = text_p + 1;
+						addCurrentRow = true;
+					}
+					else if (readingComplete) {
+						addCurrentRow = true;
+					}
+					
+					if (addCurrentRow) {
 						[csvContent addObject:csvRow];
 						previousColumnCount = [csvRow count];
 					}
+					
 					csvRow = [NSMutableArray arrayWithCapacity:previousColumnCount]; // convenience methods always autorelease
 				}
 				
-				if ((*text_p == '\0' || (quoteCount % 2) != 0) && rowStart_p != text_p) {
+				if ((rowStart_p < endChar_p && rowStart_p != text_p) && // Check for valid row start.
+					((*text_p == '\0' && !readingComplete) // End of buffer, but not end of file.
+					 ||
+					 (*text_p != '\0' && (quoteCount % 2) != 0)) // There are still unclosed quotes.
+				 ) {
 					// Restart row parsing.
+					// If we get here when we are at the end of the buffer,
+					// it may be too small to contain the entire row.
+					quoteCount = 0;
 					incompleteRow_p = rowStart_p;
 					csvRow = [NSMutableArray arrayWithCapacity:previousColumnCount];
 				}
+				else {
+					incompleteRow_p = NULL;
+				}
 			}
 			
-			if (firstLine) {
-				if ( (rowStart_p != NULL) && (rowStart_p-1 >= buffer_p) && EOL(rowStart_p-1) ) {
-					_endOfLine[0] = *(rowStart_p-1);
-
-					if ( EOL(rowStart_p) ) {
-						_endOfLine[1] = *(rowStart_p);
-					}
+			if ((firstLine) && (rowStart_p != NULL) && (rowStart_p-1 >= buffer_p) && EOL(rowStart_p-1)) {
+				_endOfLine[0] = *(rowStart_p-1);
+				
+				if ( EOL(rowStart_p) ) {
+					_endOfLine[1] = *(rowStart_p);
 				}
 				
 				firstLine = false;
